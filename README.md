@@ -1,7 +1,7 @@
 # Housing Price Prediction 
 ---
 title: "rba project"
-author: "Ali Bagheri Tirtashi"
+author: "Bhupesh Kumar Srivastava"
 date: "4/12/2022"
 output:
   word_document: default
