@@ -1,1 +1,964 @@
 # R
+---
+title: "rba project"
+author: "Ali Bagheri Tirtashi"
+date: "4/12/2022"
+output:
+  word_document: default
+---
+
+# Description
+In this project we analyse and predict housing value in a volatile market over a four years window.\
+The dataset is from kaggle.com, including the characteristics of sold houses and the microeconomics indexes.\
+While cleaning the data, we use ggplot to plot variables, making 24 graphs (including one interactive plot).\
+We use Multivariate Imputation by Chained Equations (mice), for missing variables imputation.\
+Finally we run a random search XGBoost with 1000 draws to find the best model, which outperforms simple regression by about 50 percent.
+
+
+```{r setup , echo = FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+
+```{r, results= FALSE, echo = FALSE}
+# == Data Visualisation and Wrangling == #
+library(tidyverse)
+library(data.table)
+library(lubridate)
+library(ggthemes)
+library(zoo)
+library(fastDummies)
+library(PerformanceAnalytics)
+
+
+# == Imputing Missing Data == #
+library(mice)
+library(lattice)
+
+# == Interactive Time series == #
+library(dygraphs)
+library(xts)
+
+# == Regression == #
+library(glmnet)
+
+# == XGBoost == #
+library(xgboost)
+library(Metrics)
+```
+
+```{r, echo=FALSE}
+library(caret)
+library(plm)
+library(scales)
+library(corrplot)
+library(DT)
+```
+#### set seed
+```{r, echo = FALSE}
+set.seed(1234)
+```
+
+# Loading data and initial prepration
+```{r , include=FALSE, echo = FALSE}
+setwd(getwd())
+```
+
+```{r, echo = FALSE}
+df = read.csv("data.csv" , header= TRUE)
+macro = read.csv("macro.csv" , header= TRUE)
+```
+
+# checking the data
+The data dimensions
+```{r, echo = FALSE}
+dim(df)
+dim(macro)
+```
+
+We also limit the number of variables/columns as this project isa demonstration and the resources (time/computation) are limited for intended analysis.
+```{r, echo = FALSE}
+df <- df %>% dplyr::select(timestamp,full_sq, life_sq, floor,
+                       max_floor, build_year, num_room, 
+                       kitch_sq, state, material,
+                       product_type, full_all, price_doc)
+
+macro <- macro %>% dplyr::select(timestamp,usdrub,unemployment)
+
+dim(df)
+dim(macro)
+```
+
+Converting data columns to appropriate format.
+```{r, echo = FALSE}
+df$timestamp <- as.Date(df$timestamp)
+macro$timestamp <- as.Date(macro$timestamp)
+```
+
+Extracting year and month from time column.
+```{r, echo = FALSE}
+df$year <- year(df$timestamp)
+df$month <- month(df$timestamp)
+```
+
+dummy variable creation
+```{r, echo = FALSE}
+df <- df %>% dummy_cols(select_columns = "month" , remove_first_dummy = TRUE)
+df <- df %>% dummy_cols(select_columns = "year" , remove_first_dummy = TRUE)
+df <- df[ , !(names(df) %in% c("year" , "month"))]
+colnames(df)
+```
+
+As currency volatilities does have a lasting effect on transactions, we calculate the rolling average of us dollor to rubl at 3, 7, 30 ,90 and last 365 days. 
+```{r, echo = FALSE}
+macro <- macro %>%
+    dplyr::mutate(usdrub_03da = zoo::rollmeanr(usdrub, k = 3, fill = NA),
+                  usdrub_07da = zoo::rollmeanr(usdrub, k = 7, fill = NA),
+                  usdrub_30da = zoo::rollmeanr(usdrub, k = 30, fill = NA),
+                  usdrub_90da = zoo::rollmeanr(usdrub, k = 90, fill = NA),
+                  usdrub_365da = zoo::rollmeanr(usdrub, k = 365, fill = NA))
+```
+
+
+We join the data sets.
+```{r, echo = FALSE}
+df <- df %>% left_join(macro)
+dim(df)
+```
+
+The dataset includes 30471 observations and 22 columns. We split them into train and test with a ratio of 0.75, 0.25.
+```{r , results='hide', echo = FALSE}
+split <- sample(c(rep(0, 0.75 * nrow(df)), rep(1, 0.25 * nrow(df))))
+train = df[split == 0 , ]
+test = df[split == 1 , ]
+```
+
+```{r, echo = FALSE}
+dim(train)
+dim(test)
+```
+
+
+# Explanatory Data Analysis
+In order to focus to main distributions of data, some outliers might have been removed from the graphs and they are not demonstrated separatly.\
+As we move forward through data, cleaning might take place as needed.
+
+## internal house charachteritics
+Here we list the house internal characteristics and analyse them
+
+### \Property Area
+Definition: total area in square meters, including loggias, balconies and other non-residential areas\
+Here we table the data and inspect full_Sq values. There are observations with value below 10 square meter and as they are suspicious, so we further investigate them.
+```{r, echo = FALSE}
+table(train$full_sq) 
+```
+
+If the area of a house is zero, we convert it to NA.
+```{r, echo = FALSE}
+train[,"full_sq"][train[,"full_sq"] == 0] <- NA
+```
+
+
+```{r, echo = FALSE}
+train %>% 
+  filter(full_sq < 120) %>%
+  ggplot( aes(x=full_sq)) + 
+  geom_histogram(color= "white" ,fill='dodgerblue2', bins=20) +
+  scale_y_continuous(labels = comma) + 
+  xlab("property area square meter")
+```
+
+The following is a scatter plot of the price by property area.
+```{r, echo = FALSE}
+train %>% 
+    filter(full_sq < 120) %>%
+    ggplot(aes(x=full_sq, y=price_doc)) + 
+    geom_point(color='dodgerblue2', alpha=0.1) +
+    geom_smooth(color='deeppink4') +
+    scale_y_log10() +
+    labs(x='Property Area', y='Log Price', title='Price by property area in sq meters')
+```
+
+we graph the suspicious properties, those with an area below 20 square meter. As we are not able to further investigate the matter, we let them to stay as they are.
+```{r, echo = FALSE}
+train %>% 
+    filter(full_sq < 20) %>%
+    ggplot(aes(x=full_sq, y=price_doc)) + 
+    geom_point(color='dodgerblue2', alpha=0.4) +
+    labs(x='Proerty area in square meter', y='Price', title='Price by property area in sq meters - Properties under 20 msq')
+```
+
+### living area
+
+
+The following line of code removes the living area value of observations in which the property area is smaller than living area, as we are assuming the property value is probably more reliable.
+```{r, echo = FALSE}
+train[,"life_sq"][train[,"life_sq"]>train[,"full_sq"]] <- NA 
+```
+
+Now we take a look at the distribution of the leaving area. 
+```{r, echo = FALSE}
+train %>% 
+    filter(full_sq < 1000 & life_sq < 200) %>%
+    ggplot(aes(x=life_sq)) + 
+    geom_histogram(color= "white" ,fill='dodgerblue2', bins=20) +
+    scale_y_log10()+
+    labs(x='Living Area in square meters',
+         title='Distribution of living area')
+```
+
+The following is a scatter plot of the price by living area.
+```{r, echo = FALSE}
+train %>% 
+    filter(life_sq < 120) %>%
+    ggplot(aes(x=life_sq, y=price_doc)) + 
+    geom_point(color='dodgerblue2', alpha=0.1) +
+    geom_smooth(color='deeppink4') +
+    scale_y_log10() +
+    labs(x='Living Area', y='Log Price', title='Price by property area in sq meters')
+```
+
+Next we graph leaving area against the full property area, we expect to see all values of living are below that of property area. We remove outliers from the graph to have a better view of the relation.
+```{r, echo = FALSE}
+train %>% 
+    filter(full_sq < 200 & life_sq <200) %>%
+    ggplot(aes(y=life_sq, x=full_sq)) + 
+    geom_point(color='dodgerblue2', alpha=0.3) +
+    geom_smooth(color = 'deeppink4') +
+    coord_fixed(ratio = 1)+
+    labs(y='Living Area' , x='Property Area', 
+         title='Living Area by Property area in sq meters')
+    
+```
+
+
+### Kitchen area
+
+Here we have the histogram of kitchen area.
+```{r, echo = FALSE}
+train %>% 
+    filter(kitch_sq < 100 ) %>%
+    ggplot(aes(x=kitch_sq)) + 
+    geom_histogram(color= "white" ,fill='dodgerblue2', bins=20) +
+    scale_y_log10() +
+    labs(x='Kitchen area in square meter',
+         title='Distribution of Kitchen area')
+```
+
+The following is a scatter plot of the price by kitchen area.
+```{r, echo = FALSE}
+train %>% 
+    filter(kitch_sq < 50) %>%
+    ggplot(aes(x=kitch_sq, y=price_doc)) + 
+    geom_point(color='dodgerblue2', alpha=0.1) +
+    geom_smooth(color='deeppink4') +
+    scale_y_log10() +
+    labs(x='Kitchen Area in square meters', y='Log Price', title='Price by property area in sq meters')
+```
+
+we graph the area of kitchen against the property area. As one could easily justify it, the kitchen area, increases with a small slope.
+```{r, echo = FALSE}
+train %>% 
+    filter(full_sq < 200 & kitch_sq <200) %>%
+    ggplot(aes(y=kitch_sq, x=full_sq)) + 
+    geom_point(color='dodgerblue2', alpha=0.3) +
+    geom_smooth(color = 'deeppink4') +
+    coord_fixed(ratio = 1) +
+    labs(y='Kitchen Area', x='Property Area',
+         title='Price by property area in sq meters')
+```
+
+We remove kitchen values bigger than the prperty area.
+```{r, echo = FALSE}
+train[,"kitch_sq"][train$kitch_sq>train$full_sq] <- NA
+```
+
+### floor
+
+Here we have the distribution of variable floor.
+```{r, echo = FALSE}
+train %>% 
+    filter(floor < 40) %>%
+    ggplot(aes(x=floor)) + 
+    geom_histogram(color= "white" ,fill='dodgerblue2', bins=15) +
+    scale_y_log10() +
+    labs(x='floor',
+         title='floor distribution') +
+    theme_minimal()
+```
+
+There is a small positive slope
+```{r, echo = FALSE}
+train %>% 
+    filter(floor < 40) %>%
+    ggplot(aes(x=floor, y=price_doc)) + 
+    geom_point(color='dodgerblue2', alpha=0.1) +
+    geom_smooth(color='deeppink4') +
+    scale_y_log10() +
+    labs(x='Floor', y='Log Price', title='Price by Floor')
+```
+
+### max_floor
+Here the max floor
+```{r, echo = FALSE}
+train %>% 
+    filter(max_floor < 40) %>%
+    ggplot(aes(x=max_floor)) + 
+    geom_histogram(color= "white" ,fill='dodgerblue2', bins=20) + 
+    scale_y_log10() +
+    labs(x='Max Floor', title='Distribution of max floor')
+
+```
+
+We check the property floor against the maximum number of floors. we cap the graph axises on 25 floors and 25 max floors.
+```{r, echo = FALSE}
+train %>%
+  filter(max_floor < 25 & floor < 25) %>%
+  ggplot(aes(y= floor , x= max_floor)) +
+  geom_jitter(color='deeppink4', alpha=0.1) +
+  coord_fixed(ratio = 1) +
+  labs(x='Max Floor', y='Floor', title='Floor by Max Floor')
+```
+
+We remove max_floors that are smaller than floors.
+```{r, echo = FALSE}
+train$max_floor[train$max_floor<train$floor] <- NA
+```
+
+
+```{r, echo = FALSE}
+train %>% 
+    filter(max_floor < 40) %>%
+    ggplot(aes(x=max_floor, y=price_doc)) + 
+    geom_point(color='dodgerblue2', alpha=0.1) +
+    geom_smooth(color='deeppink4') +
+    scale_y_log10() +
+    labs(x='Max Floor', y='Log Price', title='Price by property area in sq meters')
+```
+
+### material
+Here we table the material of the each house. We don't have list to know what the materials actually are./
+There is only one observation with material 1.
+```{r, echo = FALSE}
+train %>%
+  ggplot( aes(x=material)) +
+  geom_bar(fill = "dodgerblue1", color = "white") +
+  scale_x_continuous(breaks = seq(1,6,1)) +
+  geom_text(stat='count', aes(label=..count..), vjust=2)
+```
+
+
+```{r, echo = FALSE}
+train %>% 
+  na.omit() %>%
+  ggplot(aes(y=price_doc ,x=as.factor(material))) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_y_log10()+
+  labs(x='Material', y='log price', title='Property price by number of rooms')
+```
+
+
+### build_year
+We first inspect the data using table command.
+```{r, echo = FALSE}
+table(train$build_year)
+```
+
+In main dataset we set the build years before 1860 and after 2018 to NA
+```{r, echo = FALSE}
+train$build_year[train$build_year<1860 |train$build_year> 2018 ] <- NA
+```
+
+```{r, echo = FALSE}
+train %>% 
+    filter(build_year > 1840) %>%
+    ggplot(aes(x=build_year)) + 
+    geom_histogram(color= "white" ,fill='dodgerblue2', bins=30) + 
+    scale_y_log10() +
+    labs(x='Material', title='Distribution of build year')
+```
+
+The plot of price against the built year is as follows.
+As it can been seen some properties values have been rounded (either by operator or sellers)
+```{r, echo = FALSE}
+train %>% 
+    filter(build_year >1920) %>%
+    ggplot(aes(y=price_doc, x=build_year)) +
+    geom_point(color = 'dodgerblue2' ,alpha = .2)+
+    geom_smooth(color = 'deeppink2') +
+    scale_y_log10()+
+    labs(x='Build Year', y='Log Price', title='Price by build year')
+``` 
+
+
+### num_room
+We use a histogram to investigate the number of rooms.
+```{r, echo = FALSE}
+train %>% 
+  ggplot(aes(x=num_room)) +
+  geom_histogram(fill = "dodgerblue2", color = "white" ,bins=20) +
+  scale_y_log10() +
+  scale_x_continuous(breaks = seq(0,8,1))
+  labs(x='Number of Rooms', y='Count', title='number of room log scaled histogram distribution')
+```
+
+We check the property price by number of rooms, as expected there is a positive correlation.
+```{r, echo = FALSE}
+train %>% 
+  na.omit() %>%
+  ggplot(aes(y=price_doc ,x=as.factor(num_room))) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_y_log10()+
+  labs(x='Number of room', y='log price', title='Property price by number of rooms')
+```
+
+### state
+here we check the apartment condition/
+About hald the data contains unknown state.
+```{r, echo = FALSE}
+train$state[train$state == 33] <- 3
+train %>%
+  ggplot( aes(x=state)) +
+  geom_bar(fill = "dodgerblue1", color = "white") +
+  geom_text(stat='count', aes(label=..count..), vjust=2)
+```
+
+We see a slight increase in the price by state.
+```{r, echo = FALSE}
+train %>% 
+  na.omit() %>%
+  ggplot(aes(y=price_doc ,x=as.factor(state))) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_y_log10()+
+  labs(x='State', y='Log Price', title='Property price by property state')
+```
+
+### product_type
+
+Here we have property value by owner against investor. Investors are buying bigger properties.
+```{r, echo = FALSE}
+train %>% 
+  na.omit() %>%
+  ggplot(aes(y=price_doc ,x=as.factor(product_type))) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_y_log10()+
+  labs(x='Owner Type', y='Log Price', title='PRice by owner type')
+```
+
+We investigate the property area against owner-occupier purchase or investment. Occupier are buying bigger houses which can be justified by the fact that they are getting both the utility of living in the property and also having it as a investment.
+```{r, echo = FALSE}
+train %>% 
+  na.omit() %>%
+  ggplot(aes(y=full_sq ,x=as.factor(product_type))) +
+  geom_boxplot(outlier.shape = NA) +
+  scale_y_log10()+
+  labs(x='Owner Type', y='Property area', title='Property area by owner type')
+```
+
+
+
+
+## Macro data
+
+Among the columns of the Macro data, we have picked the most interesting ones.
+
+### time of transaction
+Here we check the price trend in our dataset and as we see the transaction value is continuously increasing.
+```{r, echo = FALSE}
+train %>%
+  ggplot(aes(y=price_doc , x= (timestamp) )) +
+  geom_smooth()+
+  scale_y_log10()+
+  labs(x='Time of transaction', y='Log Price', title='Price by time of transaction')
+```
+
+Now we check the scatter plot of price by month of transaction, to check seasonality. The transactions in spring are of a higher value compared to winter.
+```{r, echo = FALSE}
+train %>%
+  mutate(year = year(timestamp)) %>%
+  ggplot(aes(y=price_doc , x= month(timestamp) , color = year)) +
+  geom_smooth()+
+  scale_y_log10()+
+  scale_x_continuous(breaks = seq(1,12,1)) +
+  labs(x='Month of year', y='Log Price', title='Price by month of year of transaction')
+```
+
+### usdrub
+The graph is a proxy measurement of the Russia's economy. Inverting the Rubl to dollar conversion rate will give a better result, as we want to see how the value of Rubl is changing by time.
+#```{r,eval=FALSE, echo = FALSE}
+#don <- xts(x = (1/ macro$usdrub), order.by = macro$timestamp)
+
+#dygraph(don) %>%
+#  dyOptions(labelsUTC = TRUE, fillGraph=TRUE, fillAlpha=0.1, drawGrid = TRUE, colors="dodgerblue2") %>%
+#  dyRangeSelector() %>%
+#  dyCrosshair(direction = "vertical") %>%
+#  dyHighlight(highlightCircleSize = 5, highlightSeriesBackgroundAlpha = 0.2, hideOnMouseOut = FALSE)  %>%
+#  dyRoller(rollPeriod = 1)
+#```  
+
+```{r, echo = FALSE}
+train %>%
+  ggplot(aes(y=usdrub , x= (timestamp) )) +
+  geom_line()+
+  scale_y_log10()+
+  labs(x='Time', y='USD to ruble ratio', title='USD to ruble ratio')
+```
+
+```{r, echo = FALSE}
+train %>%
+  ggplot() +
+  geom_line(aes(y=usdrub , x= (timestamp)) ,color="dodgerblue1")+
+  geom_line(aes(y=usdrub_90da , x=(timestamp)), color="darkred", linetype="twodash")+
+  scale_y_log10()+
+  labs(x='Time', y='USD to ruble ratio', title='USD to ruble ratio vs 90 day moving average')
+```
+
+
+
+```{r, echo = FALSE}
+train %>%
+  ggplot() +
+  geom_line(aes(y=usdrub , x= (timestamp)) ,color="dodgerblue1")+
+  geom_line(aes(y=usdrub_365da , x=(timestamp)), color="darkred", linetype="twodash")+
+  scale_y_log10()+
+  labs(x='Time', y='USD to rubl ratio', title='USD to rubl ratio vs 365 day moving average')
+```
+
+
+### unemployment
+Unemplyment is another important factor 
+```{r, echo = FALSE}
+macro %>%
+  ggplot(aes(y=unemployment , x= (timestamp) )) +
+  geom_line()+
+  scale_x_date(date_breaks = "years" , date_labels = "%Y") +
+  labs(x='year', y='unemployment', title='Uneployment rate by time')
+```
+
+#### unbalanced data and sample selection
+
+Heckman sample selection bias and unbalanced pannel data
+Now we left-merge the main dataset with the macro data.
+
+
+now we have to clean the Test data, with the rules used on the train datasets.
+```{r, echo = FALSE}
+test[,"full_sq"][test[,"full_sq"] == 0] <- NA
+test[,"life_sq"][test[,"life_sq"]>test[,"full_sq"]] <- NA 
+test[,"kitch_sq"][test$kitch_sq>test$full_sq] <- NA
+test$max_floor[test$max_floor<test$floor] <- NA
+test$build_year[test$build_year<1860 |test$build_year> 2018 ] <- NA
+test$state[test$state == 33] <- 3
+```
+
+# Data type
+We transform character vectors to factor.
+```{r, echo = FALSE}
+# First we convert the train dataset characters to factor
+train[sapply(train, is.character)] <- lapply(train[sapply(train, is.character)], as.factor)
+
+# now we have to do the same for the Test, however using the factors that has been used in train only
+test$product_type  <- factor(test$product_type, levels = levels(train$product_type))
+sapply(train,class)
+sapply(test,class)
+```
+
+# Imputing the missing data
+The followings are several useful links that have been used for this project.
+This is a book on imputation by the developer of the package mice
+https://stefvanbuuren.name/fimd/ch-introduction.html
+The following is a tutorial which explains how to implement the discussed ideas.
+https://amices.org/Winnipeg/
+The following is a series of vignettes that covers the mice packages implementation.
+https://www.gerkovink.com/miceVignettes/
+
+Here we check the pattern of missing data, as we can see we have a case of multivariate missing values.
+In the graph, on the left we have the frequency of each pattern and on the right side the number of missing values.
+```{r, echo = FALSE}
+md.pattern(train, rotate.names = TRUE)
+```
+
+Now we start the imputing the missing variables using "Multivariate Imputation by Chained Equations".
+```{r,include = FALSE, echo = FALSE}
+imp <- mice(train, maxit=0)
+```
+
+First we set the prediction matrix.
+```{r, echo = FALSE}
+pred <- imp$predictorMatrix
+```
+
+We also have to consider that the column subarea and area population have perfect correlation and we should use only one of them in our analysis.
+We also skip the column timestamp as it is not a numerical variable.
+We also won't use the column price_doc as it is our target variable and we should not leak information.
+```{r, echo = FALSE}
+pred[ ,"timestamp"] <- 0
+pred[ ,"price_doc"] <- 0
+pred[,c("month_2", "month_3" , "month_4"  ,  "month_5"  ,  "month_6"  , "month_7" , "month_8", "month_9" ,     
+"month_10" , "month_11" , "month_12" , "year_2012" , "year_2013" , "year_2014" ,"year_2015","usdrub" , "unemployment","usdrub_03da", "usdrub_07da" , "usdrub_30da" , "usdrub_90da" , "usdrub_365da")] <- 0
+pred
+```
+
+Now we have to set the statistical method that we want to be used for prediction of each column.
+The mice package makes the best choices as predictive mean matching, logistic and polynomial based on data and we have to change that for variables that we think it is necessary.
+The columns that do not have a missing variable do not have a method.
+```{r, echo = FALSE}
+meth <- imp$meth
+meth
+```
+
+Now we can run the algorithm
+```{r, results='hide', echo = FALSE}
+imp <- mice(train, meth = meth, pred = pred, maxit = 5 , seed = 1234 , print = FALSE)
+```
+
+We check whether there is a trend in imputation, and the data seems fine.
+```{r, echo = FALSE}
+plot(imp)
+```
+
+We make a long dataframe, stacking iterations of imputation over each other, since we are using the data for prediction, it is fine to do so.
+```{r, echo = FALSE}
+train_stack <- complete(imp, "long") 
+dim(train_stack)
+```
+
+Now we need to impute the test data.
+```{r, results='hide', echo = FALSE}
+imp1 <- mice(test, maxit=0)
+```
+```{r, echo = FALSE}
+pred1 <- imp1$predictorMatrix
+```
+```{r, echo = FALSE}
+pred1[ ,"timestamp"] <- 0
+pred1[ ,"price_doc"] <- 0
+pred1[,c("month_2", "month_3" , "month_4"  ,  "month_5"  ,  "month_6"  , "month_7" , "month_8", "month_9" ,     
+"month_10" , "month_11" , "month_12" , "year_2012" , "year_2013" , "year_2014" ,"year_2015","usdrub" , "unemployment","usdrub_03da", "usdrub_07da" , "usdrub_30da" , "usdrub_90da" , "usdrub_365da")] <- 0
+```
+```{r, echo = FALSE}
+meth1 <- imp1$meth
+```
+```{r, results='hide', echo = FALSE}
+imp1 <- mice(test, meth = meth1, pred = pred1, maxit = 5 , seed = 1234 , print = FALSE)
+```
+```{r, echo = FALSE}
+plot(imp1)
+```
+```{r, echo = FALSE}
+test_stack <- complete(imp1, "long") 
+dim(test_stack)
+```
+
+## Correlation matrix
+```{r}
+library(stargazer)
+library(corrplot)
+round(cor(train_stack[,-c(13)][,-c(1:3)]),1)
+```
+
+
+# Model Fit
+For modeling we use a series of regressio and compare their performance
+
+## OLS regression
+But first lets do a simple regression.
+
+```{r, echo = FALSE}
+regression <- lm(price_doc ~ . + poly(full_all,2), data = train_stack[,-c(1:3)])
+regression_pred <- predict(regression, newdata = test_stack[,-c(1:3)])
+reg_mse <- sum((regression_pred - test_stack$price_doc)^2)/nrow(test_stack)
+reg_mse
+```
+
+ratio of error to price
+```{r}
+sum(abs(regression_pred - test_stack$price_doc))/sum(test_stack$price_doc)
+```
+
+```{r, echo = FALSE}
+summary(regression,header=FALSE, type="text", title="regression table")
+```
+
+
+```{r, echo = FALSE}
+library(MASS)
+library(foreign)
+# poly(full_all,2)
+rregression <- rlm(price_doc ~ .  + I(full_sq * build_year) + I(full_sq*full_all) , data = train_stack[,-c(1:3)][,-c(29)])
+rregression_pred <- predict(rregression, newdata = test_stack[,-c(1:3)][,-c(29)])
+rreg_mse <- sum((rregression_pred - test_stack$price_doc)^2)/nrow(test_stack)
+rreg_mse
+```
+```{r}
+summary(rregression)
+```
+
+
+## LASSO, Ridge, Elastic Net Rgressions
+
+https://www4.stat.ncsu.edu/~post/josh/LASSO_Ridge_Elastic_Net_-_Examples.html
+```{r, echo = FALSE}
+train_stack$product_type <- as.numeric(train_stack$product_type)
+test_stack$product_type <- as.numeric(test_stack$product_type)
+train_mx <- as.matrix(train_stack[,-c(1:3)][,-12])
+train_my <- as.matrix(train_stack$price_doc)
+test_mx <- as.matrix(test_stack[,-c(1:3)][,-12])
+test_my <- as.matrix(test_stack$price_doc)
+```
+
+with an alpha 1 one we start from lasso and go to alpha 0 for ridge and in between cover different measures for glmnet.
+```{r, echo = FALSE}
+# Fit models 
+# (For plots on left):
+fit.lasso <- glmnet(train_mx, train_my, family="gaussian", alpha=1)
+fit.ridge <- glmnet(train_mx, train_my, family="gaussian", alpha=0)
+fit.elnet <- glmnet(train_mx, train_my, family="gaussian", alpha=.5)
+
+
+# 10-fold Cross validation for each alpha = 0, 0.1, ... , 0.9, 1.0
+# (For plots on Right)
+for (i in 0:10) {
+    assign(paste("fit", i, sep=""), cv.glmnet(train_mx, train_my, type.measure="mse", 
+                                              alpha=i/10,family="gaussian"))
+}
+```
+
+```{r, echo = FALSE}
+# Plot solution paths:
+par(mfrow=c(1,2))
+# For plotting options, type '?plot.glmnet' in R console
+plot(fit.lasso, xvar="lambda")
+plot(fit10, main="LASSO")
+```
+
+```{r, echo = FALSE}
+par(mfrow=c(1,2))
+plot(fit.ridge, xvar="lambda")
+plot(fit0, main="Ridge")
+```
+```{r, echo = FALSE}
+par(mfrow=c(1,2))
+plot(fit.elnet, xvar="lambda")
+plot(fit5, main="Elastic Net")
+```
+
+```{r, echo = FALSE}
+yhat0 <- predict(fit0, s=fit0$lambda.1se, newx=test_mx)
+yhat1 <- predict(fit1, s=fit1$lambda.1se, newx=test_mx)
+yhat2 <- predict(fit2, s=fit2$lambda.1se, newx=test_mx)
+yhat3 <- predict(fit3, s=fit3$lambda.1se, newx=test_mx)
+yhat4 <- predict(fit4, s=fit4$lambda.1se, newx=test_mx)
+yhat5 <- predict(fit5, s=fit5$lambda.1se, newx=test_mx)
+yhat6 <- predict(fit6, s=fit6$lambda.1se, newx=test_mx)
+yhat7 <- predict(fit7, s=fit7$lambda.1se, newx=test_mx)
+yhat8 <- predict(fit8, s=fit8$lambda.1se, newx=test_mx)
+yhat9 <- predict(fit9, s=fit9$lambda.1se, newx=test_mx)
+yhat10 <- predict(fit10, s=fit10$lambda.1se, newx=test_mx)
+
+(mse0 <- mean((test_my - yhat0)^2))
+(mse1 <- mean((test_my - yhat1)^2))
+(mse2 <- mean((test_my - yhat2)^2))
+(mse3 <- mean((test_my - yhat3)^2))
+(mse4 <- mean((test_my - yhat4)^2))
+(mse5 <- mean((test_my - yhat5)^2))
+(mse6 <- mean((test_my - yhat6)^2))
+(mse7 <- mean((test_my - yhat7)^2))
+(mse8 <- mean((test_my - yhat8)^2))
+(mse9 <- mean((test_my - yhat9)^2))
+(mse10 <- mean((test_my - yhat10)^2))
+```
+
+although lasso and rifge are supposed to help with the problem of overfitting it seems that our dataset is not currently facing such issue and their prediction is worse.
+ 
+
+## XGBOOST Regression
+It is fast, and has been shown to outperform most competitors.
+```{r, echo = FALSE}
+train_df <- data.table(train_stack[,4:37])
+test_df  <- data.table(test_stack[,4:37])
+train_df$product_type <- as.numeric(train_df$product_type)
+test_df$product_type <- as.numeric(test_df$product_type)
+```
+
+Setting the validation dataset for XGBoost.
+```{r, echo = FALSE}
+train_id <- sample(1:nrow(train_df), size = floor(0.8 * nrow(train)), replace=FALSE)
+# Split in training and validation (80/20)
+training <- train_df[train_id,]
+validation <- train_df[-train_id,]
+```
+
+One hot encoding and setting the target variable
+```{r, echo = FALSE}
+new_tr <- model.matrix(~.+0,data = training[,-c("price_doc"),with=F]) 
+new_val<- model.matrix(~.+0,data = validation[,-c("price_doc"),with=F]) 
+new_ts <- model.matrix(~.+0,data = test_df[,-c("price_doc"),with=F])
+train_traget <- training$price_doc
+val_traget <- validation$price_doc
+test_target <- test_df$price_doc
+```
+
+preparing XGBoost matrix.
+```{r, echo = FALSE}
+dtrain <- xgb.DMatrix(data = new_tr,label = train_traget)
+dval   <- xgb.DMatrix(data = new_val,label = val_traget)
+dtest  <- xgb.DMatrix(data = new_ts,label = test_target)
+```
+
+Setting default default parameters for the first run.
+```{r, echo = FALSE}
+params <- list(booster = "gbtree", objective = "reg:squarederror",
+               eta=0.3, gamma=0, max_depth=6, min_child_weight=1,
+               subsample=1, colsample_bytree=1)
+```
+
+Running the first run
+```{r , results='hide', echo = FALSE}
+set.seed(1234)
+xgb_base <- xgb.train (params = params,
+                       data = dtrain,
+                       nrounds =1000,
+                       print_every_n = 200,
+                       eval_metric = 'rmse',
+                       early_stopping_rounds = 50,
+                       watchlist = list(train= dtrain, val= dval))
+```
+
+Now we run a random parameter search with 1000 iteration
+```{r, results='hide', echo = FALSE}
+# strt time
+start.time <- Sys.time()
+
+# empty lists
+lowest_error_list = list()
+parameters_list = list()
+
+# 1000 rows with random hyperparameters
+set.seed(1234)
+for (iter in 1:100){
+  param <- list(booster = "gbtree",
+                objective = "reg:squarederror",
+                max_depth = sample(3:10, 1),
+                eta = runif(1, .01, .3),
+                subsample = runif(1, .7, 1),
+                colsample_bytree = runif(1, .6, 1),
+                min_child_weight = sample(0:20, 1)
+  )
+  parameters <- as.data.frame(param)
+  parameters_list[[iter]] <- parameters
+}
+
+# object that contains all randomly created hyperparameters
+parameters_df = do.call(rbind, parameters_list)
+
+# using randomly created parameters to create 1000 XGBoost-models
+for (row in 1:nrow(parameters_df)){
+  set.seed(20)
+  mdcv <- xgb.train(data=dtrain,
+                    booster = "gbtree",
+                    objective = "reg:squarederror",
+                    max_depth = parameters_df$max_depth[row],
+                    eta = parameters_df$eta[row],
+                    subsample = parameters_df$subsample[row],
+                    colsample_bytree = parameters_df$colsample_bytree[row],
+                    min_child_weight = parameters_df$min_child_weight[row],
+                    print_every_n = 10000,
+                    nrounds= 300,
+                    eval_metric = "rmse",
+                    early_stopping_rounds= 30,
+                    watchlist = list(train= dtrain, val= dval)
+  )
+  lowest_error <- as.data.frame(1 - min(mdcv$evaluation_log$val_error))
+  lowest_error_list[[row]] <- lowest_error
+}
+
+# object that contains all accuracy's
+lowest_error_df = do.call(rbind, lowest_error_list)
+
+# binding columns of accuracy values and random hyperparameter values
+randomsearch = cbind(lowest_error_df, parameters_df)
+
+# end time
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+```
+```{r, echo = FALSE}
+time.taken
+```
+Here we have a table of our random search results
+```{r, results='hide', echo = FALSE}
+randomsearch <- as.data.frame(randomsearch) %>%
+  rename(val_acc = `1 - min(mdcv$evaluation_log$val_error)`) %>%
+  arrange(-val_acc)
+
+```
+
+We calculate the error of the best model on the validation set.
+```{r,results='hide', echo = FALSE}
+# Tuned-XGBoost model
+set.seed(1234)
+params <- list(booster = "gbtree", 
+               objective = "reg:squarederror",
+               max_depth = randomsearch[1,]$max_depth,
+               eta = randomsearch[1,]$eta,
+               subsample = randomsearch[1,]$subsample,
+               colsample_bytree = randomsearch[1,]$colsample_bytree,
+               min_child_weight = randomsearch[1,]$min_child_weight)
+xgb_tuned <- xgb.train(params = params,
+                       data = dtrain,
+                       nrounds =1000,
+                       print_every_n = 100,
+                       eval_metric = "rmse",
+                       early_stopping_rounds = 30,
+                       watchlist = list(train= dtrain, val= dval))
+                       
+# Make prediction on dvalid
+validation$pred_survived_tuned <- predict(xgb_tuned, dval)
+
+val_mse = sum((validation$price_doc - validation$pred_survived_tuned) ^ 2 ) / nrow(validation)
+val_mse
+```
+```{r, echo = FALSE}
+val_mse
+```
+
+And finally here we have error on the test set.
+```{r,results='hide', echo = FALSE}
+set.seed(1234)
+params <- list(booster = "gbtree", 
+               objective = "reg:squarederror",
+               max_depth = randomsearch[1,]$max_depth,
+               eta = randomsearch[1,]$eta,
+               subsample = randomsearch[1,]$subsample,
+               colsample_bytree = randomsearch[1,]$colsample_bytree,
+               min_child_weight = randomsearch[1,]$min_child_weight)
+xgb_tuned <- xgb.train(params = params,
+                       data = dtrain,
+                       nrounds =1000,
+                       eval_metric = "rmse",
+                       early_stopping_rounds = 30,
+                       watchlist = list(train= dtrain, val= dtest))
+# Make prediction on dvalid
+test_df$pred_price_tuned <- predict(xgb_tuned, dtest)
+
+test_mse = sum((test_df$price_doc - test_df$pred_price_tuned) ^ 2 ) / nrow(test_df)
+test_mse
+```
+```{r, echo = FALSE}
+test_mse
+```
+As one would expect, a randomly tuned XGBoost, drastically outperforms simple regression
+```{r, echo = FALSE}
+round(test_mse/reg_mse,2)
+```
+
+```{r}
+sum(abs(test_df$price_doc - test_df$pred_price_tuned))/sum(test_stack$price_doc)
+```
+```{r}
+(sum(abs(test_df$price_doc - test_df$pred_price_tuned))/sum(test_stack$price_doc)) / (sum(abs(regression_pred - test_stack$price_doc))/sum(test_stack$price_doc))
+```
+
