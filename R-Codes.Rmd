@@ -1,11 +1,3 @@
----
-title: "rba project"
-author: "Ali Bagheri Tirtashi"
-date: "4/12/2022"
-output:
-  word_document: default
----
-
 # Description
 In this project we analyse and predict housing value in a volatile market over a four years window.\
 The dataset is from kaggle.com, including the characteristics of sold houses and the microeconomics indexes.\
